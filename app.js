@@ -113,6 +113,10 @@ const DEFAULT_RULES = [
   ["Refund", ["refund", "reversal", "cashback"]],
 ];
 const DEFAULT_METHODS = ["UPI", "Cash", "Debit card", "Credit card", "Bank transfer", "Wallet"];
+const DEFAULT_PEOPLE = [
+  { id: "yadunath", name: "Yadunath" },
+  { id: "radhika", name: "Radhika" },
+];
 
 function defaultData() {
   const categories = DEFAULT_CATEGORIES.map(([type, name, icon], i) => ({
@@ -141,6 +145,7 @@ function defaultData() {
     recurring: [],
     goals: [],
     rules,
+    people: DEFAULT_PEOPLE.map((p) => ({ ...p })),
   };
 }
 
@@ -156,6 +161,7 @@ function normalize(data) {
     recurring: Array.isArray(data.recurring) ? data.recurring : [],
     goals: Array.isArray(data.goals) ? data.goals : [],
     rules: Array.isArray(data.rules) ? data.rules : base.rules,
+    people: Array.isArray(data.people) && data.people.length ? data.people : base.people,
   };
 }
 
@@ -175,6 +181,8 @@ function save() {
   } catch (err) {
     toast("Could not save. Phone storage may be full.");
   }
+  queueChanges();
+  schedulePush();
 }
 
 let db = load();
@@ -184,13 +192,20 @@ const ui = {
   month: monthOf(todayISO()),
   filters: null,
   showFilters: false,
+  person: "all", // "all" or a person id: whose entries Home, Entries and Reports show
 };
 
 // ---------- Lookups and maths ----------
 const FALLBACK_CAT = { id: "", name: "Unknown", icon: "❓", color: "#94a3b8", type: "expense" };
 const cat = (id) => db.categories.find((c) => c.id === id) || FALLBACK_CAT;
 const catsOfType = (type) => db.categories.filter((c) => c.type === type);
-const txInMonth = (mk) => db.transactions.filter((t) => t.date.startsWith(mk));
+// Entries made before family sync have no person, so they belong to this phone's owner
+const personOf = (t) => t.person || me();
+const personName = (id) => db.people.find((p) => p.id === id)?.name || id;
+const visibleTx = () => (ui.person === "all" ? db.transactions : db.transactions.filter((t) => personOf(t) === ui.person));
+const txInMonth = (mk, list = visibleTx()) => list.filter((t) => t.date.startsWith(mk));
+// Show names and the Both/Me/Her switch once more than one person is using the book
+const shared = () => connected() || db.transactions.some((t) => personOf(t) !== me());
 const sortTx = (list) =>
   [...list].sort((a, b) => (a.date === b.date ? (b.createdAt || 0) - (a.createdAt || 0) : a.date < b.date ? 1 : -1));
 
@@ -221,18 +236,26 @@ function fallbackCategory(type, excludeId) {
 
 // ---------- Recurring entries ----------
 // Adds any monthly entries that are due (also catches up missed months).
+// The id is fixed per entry and month, so two phones adding the same rent never make a duplicate.
 function generateRecurring() {
   const today = todayISO();
   const current = monthOf(today);
+  const have = new Set(db.transactions.map((t) => t.id));
   let added = 0;
+  let moved = false;
   for (const r of db.recurring) {
     let m = r.lastGenerated ? addMonths(r.lastGenerated, 1) : r.startMonth;
     let guard = 0;
     while (m <= current && guard++ < 240) {
       const date = `${m}-${pad(Math.min(r.day, daysIn(m)))}`;
       if (date > today) break;
+      const id = `rec-${r.id}-${m}`;
+      r.lastGenerated = m;
+      m = addMonths(m, 1);
+      if (have.has(id) || sync.deleted.includes(id)) continue;
       db.transactions.push({
-        id: uid(),
+        id,
+        person: r.person || me(),
         type: cat(r.categoryId).type,
         amount: r.amount,
         date,
@@ -242,12 +265,12 @@ function generateRecurring() {
         recurringId: r.id,
         createdAt: Date.now(),
       });
-      r.lastGenerated = m;
+      have.add(id);
       added++;
-      m = addMonths(m, 1);
     }
+    if (guard) moved = true;
   }
-  if (added) save();
+  if (added || moved) save();
   return added;
 }
 
@@ -337,7 +360,8 @@ function progressBar(value, total) {
 function txRow(t) {
   const c = cat(t.categoryId);
   const sign = t.type === "income" ? "+" : "-";
-  const sub = [c.name, t.method, dateLabel(t.date)].filter(Boolean).join(" · ");
+  const who = shared() && ui.person === "all" ? personName(personOf(t)) : "";
+  const sub = [who, c.name, t.method, dateLabel(t.date)].filter(Boolean).join(" · ");
   return `<li class="tx" data-action="edit-tx" data-id="${esc(t.id)}">
     <span class="tx-ico" style="background:${c.color}22">${esc(c.icon)}</span>
     <span class="tx-main">
@@ -372,6 +396,9 @@ function methodOptions(selected, { all = false } = {}) {
 
 function toast(msg) {
   const el = $("#toast");
+  // Inside an open pop-up the message must live in the pop-up, or it's hidden behind it
+  const host = sheet.open ? sheet : document.body;
+  if (el.parentNode !== host) host.appendChild(el);
   el.textContent = msg;
   el.hidden = false;
   clearTimeout(toast.timer);
@@ -397,6 +424,18 @@ function render() {
   $("#view-title").textContent = TITLES[ui.view];
   $("#month-switch").hidden = ui.view === "more";
   $("#fab").hidden = ui.view === "more";
+  // Both / Yadunath / Radhika switch (budgets are always for the whole family)
+  const bar = $("#person-bar");
+  bar.hidden = !shared() || ui.view === "more" || ui.view === "budgets";
+  if (!bar.hidden) {
+    bar.innerHTML = [{ id: "all", name: "Both" }, ...db.people]
+      .map(
+        (p) =>
+          `<button class="chip ${ui.person === p.id ? "on" : ""}" data-action="set-person" data-person="${esc(p.id)}">${esc(p.name)}${p.id === me() ? " (me)" : ""}</button>`
+      )
+      .join("");
+  }
+  updateSyncStatus();
   $("#month-label").textContent = ui.view === "reports" ? ui.month.slice(0, 4) : monthLabel(ui.month);
   for (const v of Object.keys(TITLES)) $(`#view-${v}`).hidden = v !== ui.view;
   $$(".bottom-nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === ui.view));
@@ -410,9 +449,16 @@ function renderHome() {
   const t = totals(list);
   const rate = t.inc > 0 ? Math.round((t.bal / t.inc) * 100) : null;
   // Only count spending in categories that have a budget, so rent etc. doesn't show as "over budget"
+  // Budgets are for the whole family, so they count everyone's spending
   const budgeted = catsOfType("expense").filter((c) => Number(db.budgets[c.id]) > 0);
   const budgetTotal = sum(budgeted, (c) => Number(db.budgets[c.id]));
-  const budgetSpent = sum(list.filter((x) => x.type === "expense" && db.budgets[x.categoryId] > 0), (x) => x.amount);
+  const familyList = txInMonth(ui.month, db.transactions);
+  const budgetSpent = sum(familyList.filter((x) => x.type === "expense" && db.budgets[x.categoryId] > 0), (x) => x.amount);
+  // Who spent what (only on "Both")
+  const perPerson =
+    shared() && ui.person === "all"
+      ? db.people.map((p) => ({ p, t: totals(familyList.filter((x) => personOf(x) === p.id)) }))
+      : [];
 
   // Month vs last month
   const prevMk = addMonths(ui.month, -1);
@@ -449,8 +495,21 @@ function renderHome() {
         <div><div class="label">Spent</div><div class="value expense">${esc(moneyR(t.exp))}</div></div>
         <div><div class="label">Left</div><div class="value ${t.bal < 0 ? "expense" : ""}">${esc(moneyR(t.bal))}</div></div>
       </div>
-      ${rate !== null ? `<div class="small muted" style="margin-top:8px">You saved ${rate}% of your income this month.</div>` : ""}
+      ${rate !== null ? `<div class="small muted" style="margin-top:8px">${esc(saverLabel())} saved ${rate}% of the income this month.</div>` : ""}
     </div>
+
+    ${
+      perPerson.length
+        ? `<div class="card"><h2>Who spent what</h2>
+        ${perPerson
+          .map(
+            ({ p, t: pt }) => `<div class="row"><span>${esc(p.name)}</span>
+            <span class="small"><span class="income">+${esc(moneyR(pt.inc))}</span> · <span class="expense">-${esc(moneyR(pt.exp))}</span></span></div>`
+          )
+          .join("")}
+      </div>`
+        : ""
+    }
 
     ${
       budgetTotal > 0
@@ -483,6 +542,11 @@ function renderHome() {
           : `<div class="empty">No entries for ${esc(monthLabel(ui.month))}. Tap + to add one.</div>`
       }
     </div>`;
+}
+
+function saverLabel() {
+  if (ui.person === "all") return shared() ? "Together you" : "You";
+  return ui.person === me() ? "You" : personName(ui.person);
 }
 
 // For spending, going up is bad (red). For income, going up is good (green).
@@ -518,7 +582,7 @@ function applyFilters(f) {
   const min = parseFloat(f.min);
   const max = parseFloat(f.max);
   return sortTx(
-    db.transactions.filter((t) => {
+    visibleTx().filter((t) => {
       if (f.from && t.date < f.from) return false;
       if (f.to && t.date > f.to) return false;
       if (f.type !== "all" && t.type !== f.type) return false;
@@ -605,7 +669,7 @@ function renderListResults() {
 
 // ----- Budgets -----
 function renderBudgets() {
-  const list = txInMonth(ui.month);
+  const list = txInMonth(ui.month, db.transactions);
   const spent = new Map(byCategory(list, "expense").map((x) => [x.cat.id, x.amount]));
   const withBudget = catsOfType("expense").filter((c) => Number(db.budgets[c.id]) > 0);
   const noBudget = catsOfType("expense").filter((c) => !(Number(db.budgets[c.id]) > 0) && spent.get(c.id));
@@ -616,7 +680,7 @@ function renderBudgets() {
     ${
       withBudget.length
         ? `<div class="card">
-        <div class="row"><strong>All budgets</strong><span class="small muted">${esc(money(totalSpent))} of ${esc(money(totalBudget))}</span></div>
+        <div class="row"><strong>${shared() ? "Family budgets (both of you)" : "All budgets"}</strong><span class="small muted">${esc(money(totalSpent))} of ${esc(money(totalBudget))}</span></div>
         ${progressBar(totalSpent, totalBudget)}
         <div class="small ${totalSpent > totalBudget ? "expense" : "muted"}" style="margin-top:6px">
           ${totalSpent > totalBudget ? `${esc(money(totalSpent - totalBudget))} over` : `${esc(money(totalBudget - totalSpent))} left`} for ${esc(monthLabel(ui.month))}
@@ -650,7 +714,7 @@ function renderBudgets() {
 // ----- Reports (year view + savings goals) -----
 function renderReports() {
   const year = ui.month.slice(0, 4);
-  const yearList = db.transactions.filter((t) => t.date.startsWith(year));
+  const yearList = visibleTx().filter((t) => t.date.startsWith(year));
   const months = MONTHS.map((label, i) => {
     const t = totals(txInMonth(`${year}-${pad(i + 1)}`));
     return { label, inc: t.inc, exp: t.exp };
@@ -729,7 +793,18 @@ function goalBlock(g) {
 // ----- More (settings) -----
 function renderMore() {
   const used = Math.round(((localStorage.getItem(STORAGE_KEY) || "").length * 2) / 1024);
+  const familyCard = connected()
+    ? `<div class="card"><h2>Family sync</h2><ul class="menu">
+      <li class="clickable" data-action="pick-me-again"><span>📱 This phone belongs to</span><span class="muted">${esc(personName(me()))} ›</span></li>
+      <li class="clickable" data-action="open-people"><span>👥 Names</span><span class="muted">${esc(db.people.map((p) => p.name).join(", "))} ›</span></li>
+      <li class="clickable" data-action="sync-now"><span>🔄 Sync now</span><span class="muted">›</span></li>
+      <li class="clickable" data-action="sign-out"><span class="expense">🚪 Sign out this phone</span><span class="muted">›</span></li>
+    </ul><div class="small muted" id="sync-status" style="margin-top:8px">${esc(syncStatusText())}</div></div>`
+    : `<div class="card"><h2>Family sync</h2>
+      <p class="small muted" style="margin-top:0">Connect to your family book so Yadunath and Radhika see each other's entries on both phones.</p>
+      <button class="btn block" data-action="open-connect">Connect family book</button></div>`;
   $("#view-more").innerHTML = `
+    ${familyCard}
     <div class="card"><h2>Setup</h2><ul class="menu">
       <li class="clickable" data-action="open-categories"><span>🗂️ Categories</span><span class="muted">${db.categories.length} ›</span></li>
       <li class="clickable" data-action="open-recurring"><span>🔁 Repeating entries (rent, salary, EMIs)</span><span class="muted">${db.recurring.length} ›</span></li>
@@ -746,9 +821,13 @@ function renderMore() {
       <li class="clickable" data-action="export-all"><span>📤 Export all entries (CSV for Excel)</span><span class="muted">›</span></li>
       <li class="clickable" data-action="backup"><span>💾 Save backup file</span><span class="muted">›</span></li>
       <li class="clickable" data-action="restore"><span>♻️ Restore from backup</span><span class="muted">›</span></li>
-      <li class="clickable" data-action="clear-all"><span class="expense">🗑️ Delete all data</span><span class="muted">›</span></li>
+      ${connected() ? "" : `<li class="clickable" data-action="clear-all"><span class="expense">🗑️ Delete all data</span><span class="muted">›</span></li>`}
     </ul>
-    <div class="small muted" style="margin-top:8px">${db.transactions.length} entries · about ${used} KB · stored only on this device. Save a backup now and then, because clearing your browser data deletes it.</div>
+    <div class="small muted" style="margin-top:8px">${db.transactions.length} entries · about ${used} KB · ${
+      connected()
+        ? "saved on this phone and in your family book online."
+        : "stored only on this device. Save a backup now and then, because clearing your browser data deletes it."
+    }</div>
     </div>
 
     <div class="card"><h2>App</h2><ul class="menu">
@@ -785,8 +864,25 @@ sheet.addEventListener("click", (e) => {
 // ----- Add / edit entry -----
 let txDraft = null;
 
+// Someone else's entry: show it, but only its owner can change it
+function openTxView(t) {
+  const c = cat(t.categoryId);
+  const owner = personName(personOf(t));
+  openSheet(`<h2>${esc(t.note || c.name)}</h2>
+    <div class="card" style="margin-bottom:12px">
+      <div class="row"><span class="muted">Amount</span><strong class="${t.type}">${t.type === "income" ? "+" : "-"}${esc(money(t.amount))}</strong></div>
+      <div class="row"><span class="muted">Category</span><span>${esc(c.icon)} ${esc(c.name)}</span></div>
+      <div class="row"><span class="muted">Date</span><span>${esc(dateLabel(t.date))}</span></div>
+      ${t.method ? `<div class="row"><span class="muted">Payment method</span><span>${esc(t.method)}</span></div>` : ""}
+      <div class="row"><span class="muted">Added by</span><span>${esc(owner)}</span></div>
+    </div>
+    <p class="small muted">Only ${esc(owner)} can edit or delete this entry, from their phone.</p>
+    <div class="actions"><button class="btn secondary" data-action="close-sheet">Close</button></div>`);
+}
+
 function openTxForm(id) {
   const t = id ? db.transactions.find((x) => x.id === id) : null;
+  if (t && personOf(t) !== me()) return openTxView(t);
   const today = todayISO();
   txDraft = t
     ? { ...t }
@@ -843,8 +939,14 @@ function saveTx(form) {
   const fd = new FormData(form);
   const amount = round2(parseFloat(fd.get("amount")));
   if (!(amount > 0)) return toast("Enter an amount above zero.");
-  if (!txDraft.categoryId) return toast("Pick a category.");
+  if (!txDraft.categoryId) {
+    const chips = $("#cat-chips");
+    chips.classList.add("need");
+    chips.scrollIntoView({ behavior: "smooth", block: "center" });
+    return toast("Pick a category first.");
+  }
   const entry = {
+    person: txDraft.person || me(),
     type: txDraft.type,
     amount,
     date: fd.get("date"),
@@ -859,6 +961,7 @@ function saveTx(form) {
     if (fd.get("repeat")) {
       const r = {
         id: uid(),
+        person: entry.person,
         amount,
         categoryId: entry.categoryId,
         method: entry.method,
@@ -960,7 +1063,7 @@ function openRecurring() {
             .map((r) => {
               const c = cat(r.categoryId);
               return `<li class="clickable" data-action="edit-rec" data-id="${esc(r.id)}">
-              <span>${esc(c.icon)} ${esc(r.note || c.name)}<br><span class="small muted">Every month on day ${r.day}${r.method ? ` · ${esc(r.method)}` : ""}</span></span>
+              <span>${esc(c.icon)} ${esc(r.note || c.name)}<br><span class="small muted">${shared() ? `${esc(personName(r.person || me()))} · ` : ""}Every month on day ${r.day}${r.method ? ` · ${esc(r.method)}` : ""}</span></span>
               <span class="tx-amt ${c.type}">${esc(money(r.amount))}</span></li>`;
             })
             .join("")}</ul>`
@@ -1004,7 +1107,7 @@ function saveRecurring(form) {
   if (!(amount > 0)) return toast("Enter an amount above zero.");
   const fields = { amount, categoryId: fd.get("categoryId"), note: fd.get("note").trim(), day, method: fd.get("method") || "" };
   if (id) Object.assign(db.recurring.find((r) => r.id === id), fields);
-  else db.recurring.push({ id: uid(), ...fields, startMonth: fd.get("startMonth"), lastGenerated: null });
+  else db.recurring.push({ id: uid(), person: me(), ...fields, startMonth: fd.get("startMonth"), lastGenerated: null });
   const added = generateRecurring();
   save();
   render();
@@ -1310,6 +1413,7 @@ function commitImport() {
   chosen.forEach((x, i) =>
     db.transactions.push({
       id: uid(),
+      person: me(),
       type: x.type,
       amount: x.amount,
       date: x.date,
@@ -1332,9 +1436,9 @@ function exportCSV(list, name) {
     const s = String(v ?? "");
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const lines = [["Date", "Type", "Category", "Amount", "Payment method", "Note"].join(",")];
+  const lines = [["Date", "Person", "Type", "Category", "Amount", "Payment method", "Note"].join(",")];
   for (const t of sortTx(list).reverse()) {
-    lines.push([t.date, t.type, cat(t.categoryId).name, t.amount, t.method, t.note].map(cell).join(","));
+    lines.push([t.date, personName(personOf(t)), t.type, cat(t.categoryId).name, t.amount, t.method, t.note].map(cell).join(","));
   }
   // The BOM at the start makes Excel read ₹ and other symbols correctly
   download(name, "﻿" + lines.join("\r\n"), "text/csv;charset=utf-8");
@@ -1351,6 +1455,17 @@ function restoreFrom(file) {
     try {
       const data = JSON.parse(String(reader.result));
       if (!Array.isArray(data.transactions) || !Array.isArray(data.categories)) throw new Error("bad file");
+      if (connected()) {
+        // Shared book: add the backup's missing entries instead of wiping both phones
+        const have = new Set(db.transactions.map((t) => t.id));
+        const missing = data.transactions.filter((t) => !have.has(t.id));
+        if (!missing.length) return toast("Everything in this backup is already in the family book.");
+        if (!confirm(`Add ${missing.length} entries from this backup to the family book?`)) return;
+        for (const t of missing) db.transactions.push({ ...t, person: t.person || me() });
+        save();
+        render();
+        return toast(`Added ${missing.length} entries`);
+      }
       if (!confirm(`Replace everything in the app with this backup (${data.transactions.length} entries)?`)) return;
       db = normalize(data);
       save();
@@ -1381,7 +1496,7 @@ function reminderDue() {
   const d = new Date();
   const now = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   const today = todayISO();
-  return now >= s.reminderTime && !db.transactions.some((t) => t.date === today);
+  return now >= s.reminderTime && !db.transactions.some((t) => t.date === today && personOf(t) === me());
 }
 
 function checkReminder() {
@@ -1426,6 +1541,410 @@ function openTheme() {
     <div class="actions"><button class="btn secondary" data-action="close-sheet">Done</button></div>`);
 }
 
+// ---------- Family sync (Supabase) ----------
+// Each phone keeps a full copy (so it works offline) and swaps changes with the family book online.
+// Only the family login can read the data (see supabase-setup.sql).
+const SB = {
+  url: localStorage.getItem("money-book-sb-url") || "https://nlmsnzrzpmfhorgbmhnw.supabase.co",
+  key: "sb_publishable_NJiJbV0uq6wabv6fOgJ26A__BtjCEAu",
+};
+const SYNC_KEY = "money-book-sync";
+// Shared family setup, saved online as one row each
+const HH_KEYS = ["categories", "budgets", "recurring", "goals", "rules", "methods", "people"];
+
+function loadSync() {
+  const empty = { session: null, me: null, outbox: {}, dirty: [], cursor: "", deleted: [], lastSync: 0, status: "" };
+  try {
+    return { ...empty, ...JSON.parse(localStorage.getItem(SYNC_KEY) || "{}") };
+  } catch {
+    return empty;
+  }
+}
+function saveSync() {
+  try {
+    localStorage.setItem(SYNC_KEY, JSON.stringify(sync));
+  } catch {
+    /* storage full: the next save will try again */
+  }
+}
+// `var` so functions above can read these during start-up
+var sync = loadSync();
+function connected() {
+  return !!sync.session;
+}
+function me() {
+  return sync.me || "yadunath";
+}
+
+const hhGet = (k) => (k === "methods" ? db.settings.methods : db[k]);
+function hhSet(k, v) {
+  if (k === "methods") db.settings.methods = v;
+  else db[k] = v;
+}
+
+// What the family book already has (or has been queued). Comparing against it shows what changed.
+var snap = null;
+function takeSnapshot() {
+  snap = {
+    e: new Map(db.transactions.map((t) => [t.id, JSON.stringify(t)])),
+    h: Object.fromEntries(HH_KEYS.map((k) => [k, JSON.stringify(hhGet(k))])),
+  };
+}
+function queueChanges() {
+  if (!connected()) return;
+  if (!snap) takeSnapshot();
+  const now = new Map();
+  for (const t of db.transactions) {
+    const j = JSON.stringify(t);
+    now.set(t.id, j);
+    if (snap.e.get(t.id) !== j) sync.outbox[t.id] = t;
+  }
+  for (const id of snap.e.keys()) if (!now.has(id)) sync.outbox[id] = null; // null = deleted
+  for (const k of HH_KEYS) {
+    const j = JSON.stringify(hhGet(k));
+    if (snap.h[k] !== j) {
+      if (!sync.dirty.includes(k)) sync.dirty.push(k);
+      snap.h[k] = j;
+    }
+  }
+  snap.e = now;
+  saveSync();
+}
+
+let pushTimer = null;
+function schedulePush() {
+  if (!connected()) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(runSync, 800);
+}
+
+async function authRequest(grant, body) {
+  const res = await fetch(`${SB.url}/auth/v1/token?grant_type=${grant}`, {
+    method: "POST",
+    headers: { apikey: SB.key, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error_description || data.msg || data.message || "Sign in failed");
+    err.status = res.status;
+    throw err;
+  }
+  return {
+    access: data.access_token,
+    refresh: data.refresh_token,
+    expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
+    userId: data.user?.id,
+    email: data.user?.email,
+  };
+}
+
+async function token() {
+  const s = sync.session;
+  if (Date.now() < s.expiresAt - 60000) return s.access;
+  try {
+    sync.session = await authRequest("refresh_token", { refresh_token: s.refresh });
+  } catch (err) {
+    if (err.status >= 400 && err.status < 500) err.needsLogin = true;
+    throw err;
+  }
+  saveSync();
+  return sync.session.access;
+}
+
+async function api(path, { method = "GET", body, prefer } = {}) {
+  const headers = { apikey: SB.key, Authorization: `Bearer ${await token()}`, "Content-Type": "application/json" };
+  if (prefer) headers.Prefer = prefer;
+  const res = await fetch(`${SB.url}/rest/v1/${path}`, { method, headers, body: body && JSON.stringify(body) });
+  if (!res.ok) {
+    const err = new Error(`Sync error ${res.status}: ${await res.text().catch(() => "")}`);
+    err.status = res.status;
+    if (res.status === 401) err.needsLogin = true;
+    throw err;
+  }
+  return method === "GET" ? res.json() : null;
+}
+
+async function pullEntries(since) {
+  const rows = [];
+  for (let offset = 0; ; offset += 1000) {
+    const page = await api(
+      `entries?select=id,data,deleted,updated_at&updated_at=gte.${encodeURIComponent(since)}&order=updated_at.asc,id.asc&limit=1000&offset=${offset}`
+    );
+    rows.push(...page);
+    if (page.length < 1000) return rows;
+  }
+}
+
+// Apply the other phone's changes. Our own unsent changes win until they're sent.
+function applyEntries(rows) {
+  let changed = false;
+  const byId = new Map(db.transactions.map((t) => [t.id, t]));
+  for (const r of rows) {
+    if (r.updated_at > sync.cursor) sync.cursor = r.updated_at;
+    if (r.id in sync.outbox) continue;
+    if (r.deleted) {
+      if (byId.delete(r.id)) changed = true;
+      if (!sync.deleted.includes(r.id)) sync.deleted.push(r.id);
+    } else if (JSON.stringify(byId.get(r.id)) !== JSON.stringify(r.data)) {
+      byId.set(r.id, r.data);
+      changed = true;
+    }
+  }
+  if (sync.deleted.length > 3000) sync.deleted = sync.deleted.slice(-2000);
+  if (changed) db.transactions = [...byId.values()];
+  return changed;
+}
+
+async function pullHousehold() {
+  const rows = await api("household?select=key,data");
+  let changed = false;
+  for (const r of rows) {
+    if (!HH_KEYS.includes(r.key) || sync.dirty.includes(r.key)) continue;
+    if (JSON.stringify(hhGet(r.key)) !== JSON.stringify(r.data)) {
+      hhSet(r.key, r.data);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+async function push() {
+  const owner = sync.session.userId;
+  const ids = Object.keys(sync.outbox);
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    const sent = chunk.map((id) => JSON.stringify(sync.outbox[id]));
+    await api("entries?on_conflict=id", {
+      method: "POST",
+      prefer: "resolution=merge-duplicates,return=minimal",
+      body: chunk.map((id) =>
+        sync.outbox[id] ? { id, owner, data: sync.outbox[id], deleted: false } : { id, owner, data: {}, deleted: true }
+      ),
+    });
+    // Only clear what didn't change again while we were sending
+    chunk.forEach((id, n) => {
+      if (JSON.stringify(sync.outbox[id]) === sent[n]) delete sync.outbox[id];
+    });
+    saveSync();
+  }
+  if (sync.dirty.length) {
+    const keys = [...sync.dirty];
+    const sent = keys.map((k) => JSON.stringify(hhGet(k)));
+    await api("household?on_conflict=owner,key", {
+      method: "POST",
+      prefer: "resolution=merge-duplicates,return=minimal",
+      body: keys.map((k) => ({ owner, key: k, data: hhGet(k) })),
+    });
+    sync.dirty = sync.dirty.filter((k) => {
+      const n = keys.indexOf(k);
+      return n < 0 || JSON.stringify(hhGet(k)) !== sent[n];
+    });
+    saveSync();
+  }
+}
+
+let syncing = null;
+function runSync() {
+  if (!connected() || sync.needsLogin) return Promise.resolve();
+  if (syncing) return syncing;
+  syncing = (async () => {
+    try {
+      await push();
+      // Look back 2 minutes each time, so a change saved at the same moment is never missed
+      const since = sync.cursor ? new Date(Date.parse(sync.cursor) - 120000).toISOString() : "1970-01-01T00:00:00Z";
+      const changedE = applyEntries(await pullEntries(since));
+      const changedH = await pullHousehold();
+      sync.lastSync = Date.now();
+      sync.status = "ok";
+      if (changedE || changedH) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+        takeSnapshot();
+        generateRecurring();
+        // Don't wipe what someone is typing in the search box
+        if (ui.view === "list" && document.activeElement?.dataset?.filter) renderListResults();
+        else render();
+      }
+    } catch (err) {
+      if (err.needsLogin) {
+        sync.needsLogin = true;
+        sync.status = "login";
+      } else sync.status = err instanceof TypeError ? "offline" : "error";
+      console.warn("Sync failed:", err.message);
+    } finally {
+      syncing = null;
+      saveSync();
+      updateSyncStatus();
+    }
+  })();
+  return syncing;
+}
+
+function timeAgo(ms) {
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return dateLabel(new Date(ms).toISOString().slice(0, 10));
+}
+
+function syncStatusText() {
+  if (!connected()) return "";
+  const waiting = Object.keys(sync.outbox).length + sync.dirty.length;
+  if (sync.needsLogin) return "Sync stopped. Sign in again to keep syncing.";
+  if (sync.status === "offline") return `Offline. ${waiting ? `${waiting} changes will sync when you're back online.` : "Will sync when you're back online."}`;
+  if (sync.status === "error") return `Couldn't sync, will keep trying. ${waiting} changes waiting.`;
+  if (waiting) return `Syncing ${waiting} changes…`;
+  return `Signed in as ${sync.session.email || "family"}. Up to date, last synced ${sync.lastSync ? timeAgo(sync.lastSync) : "not yet"}.`;
+}
+
+function updateSyncStatus() {
+  const el = $("#sync-status");
+  if (el) el.textContent = syncStatusText();
+  $("#sync-banner").hidden = !(connected() && sync.needsLogin);
+}
+
+// ----- Connect a phone -----
+let pendingSession = null;
+
+function openConnect(msg) {
+  openSheet(`<h2>Connect family book</h2>
+    <p class="small muted" style="margin-top:-6px">Use the family email and password you made in Supabase. You type this only once on this phone.</p>
+    <form data-form="connect">
+      <label class="field"><span>Family email</span><input name="email" type="email" required autocomplete="username" value="${esc(sync.session?.email || "")}"></label>
+      <label class="field"><span>Family password</span><input name="password" type="password" required autocomplete="current-password"></label>
+      <div class="small expense" style="margin-bottom:10px" ${msg ? "" : "hidden"}>${esc(msg || "")}</div>
+      <div class="actions"><button type="button" class="btn secondary" data-action="close-sheet">Not now</button><button type="submit" class="btn">Connect</button></div>
+    </form>`);
+}
+
+async function submitConnect(form) {
+  const fd = new FormData(form);
+  const btn = $("button[type=submit]", form);
+  btn.disabled = true;
+  btn.textContent = "Connecting…";
+  let session;
+  try {
+    session = await authRequest("password", { email: fd.get("email").trim(), password: fd.get("password") });
+  } catch (err) {
+    return openConnect(err.status ? "That email or password didn't work. Check them and try again." : "No internet. Connect once while online.");
+  }
+  // Signing back in on a phone that was already connected: just carry on
+  if (sync.session && sync.session.userId === session.userId) {
+    sync.session = session;
+    sync.needsLogin = false;
+    saveSync();
+    closeSheet();
+    toast("Signed in again");
+    return runSync();
+  }
+  pendingSession = session;
+  openWhoAmI(true);
+}
+
+function openWhoAmI(connecting) {
+  openSheet(`<h2>Who uses this phone?</h2>
+    <p class="small muted" style="margin-top:-6px">Entries you add here are saved under this name. You can change it later in More.</p>
+    <div class="stack">
+      ${db.people
+        .map((p) => `<button class="btn block ${p.id === me() ? "" : "secondary"}" data-action="pick-me" data-id="${esc(p.id)}" data-connecting="${connecting ? 1 : ""}">${esc(p.name)}</button>`)
+        .join("")}
+    </div>`);
+}
+
+async function pickMe(id, connecting) {
+  sync.me = id;
+  saveSync();
+  if (!connecting) {
+    ui.person = "all";
+    closeSheet();
+    render();
+    return toast(`This phone now adds entries as ${personName(id)}`);
+  }
+  openSheet(`<h2>Connecting…</h2><p class="muted">Getting the family book. This takes a few seconds.</p>`);
+  await finishConnect(pendingSession);
+}
+
+async function finishConnect(session) {
+  const prev = sync;
+  sync = { ...loadSync(), session, me: prev.me, outbox: {}, dirty: [], cursor: "", deleted: [], needsLogin: false };
+  try {
+    const remoteHH = await api("household?select=key,data");
+    const remote = await pullEntries("1970-01-01T00:00:00Z");
+    const remoteIds = new Set(remote.map((r) => r.id));
+    const localOnly = db.transactions.filter((t) => !remoteIds.has(t.id));
+    if (localOnly.length && !confirm(`Move the ${localOnly.length} entries on this phone into the family book as ${personName(sync.me)}'s?`)) {
+      sync = prev;
+      saveSync();
+      return closeSheet();
+    }
+    if (remoteHH.length) {
+      // The family book already has a setup: use it, and match this phone's categories by name
+      const oldCats = db.categories;
+      for (const r of remoteHH) if (HH_KEYS.includes(r.key)) hhSet(r.key, r.data);
+      for (const t of localOnly) {
+        if (db.categories.some((c) => c.id === t.categoryId)) continue;
+        const old = oldCats.find((c) => c.id === t.categoryId);
+        const match = old && db.categories.find((c) => c.type === old.type && c.name.toLowerCase() === old.name.toLowerCase());
+        t.categoryId = match ? match.id : fallbackCategory(t.type)?.id;
+      }
+    } else {
+      // First phone: this phone's setup becomes the family setup
+      for (const r of db.recurring) if (!r.person) r.person = sync.me;
+      sync.dirty = [...HH_KEYS];
+    }
+    for (const t of localOnly) {
+      if (!t.person) t.person = sync.me;
+      sync.outbox[t.id] = t;
+    }
+    db.transactions = [...remote.filter((r) => !r.deleted).map((r) => r.data), ...localOnly];
+    for (const r of remote) {
+      if (r.updated_at > sync.cursor) sync.cursor = r.updated_at;
+      if (r.deleted) sync.deleted.push(r.id);
+    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+    takeSnapshot();
+    saveSync();
+    ui.person = "all";
+    closeSheet();
+    generateRecurring();
+    render();
+    toast("Connected to the family book");
+    await runSync();
+  } catch (err) {
+    console.warn(err);
+    sync = prev;
+    saveSync();
+    openConnect("Couldn't reach the family book. Check your internet and try again.");
+  }
+}
+
+function signOut() {
+  const waiting = Object.keys(sync.outbox).length + sync.dirty.length;
+  const msg = waiting
+    ? `${waiting} changes on this phone haven't reached the family book yet and will be lost. Sign out anyway?`
+    : "Sign out this phone? Everything stays safe in the family book. This phone's copy is removed.";
+  if (!confirm(msg)) return;
+  localStorage.removeItem(SYNC_KEY);
+  localStorage.removeItem(STORAGE_KEY);
+  sync = loadSync();
+  sync.promptSeen = true;
+  saveSync();
+  db = defaultData();
+  snap = null;
+  ui.person = "all";
+  render();
+  toast("Signed out");
+}
+
+function openPeople() {
+  openSheet(`<h2>Names</h2>
+    <form data-form="people">
+      ${db.people.map((p) => `<label class="field"><span>Person ${db.people.indexOf(p) + 1}</span><input name="${esc(p.id)}" required maxlength="20" value="${esc(p.name)}"></label>`).join("")}
+      <div class="actions"><button type="button" class="btn secondary" data-action="close-sheet">Cancel</button><button type="submit" class="btn">Save</button></div>
+    </form>`);
+}
+
 // ---------- Event wiring ----------
 const actions = {
   nav: (el) => {
@@ -1443,6 +1962,7 @@ const actions = {
   },
   "pick-cat": (el) => {
     txDraft.categoryId = el.dataset.id;
+    $("#cat-chips").classList.remove("need");
     $("#cat-chips").innerHTML = catChips();
   },
   "delete-tx": () => {
@@ -1511,6 +2031,22 @@ const actions = {
     render();
     toast("All data deleted");
   },
+  "set-person": (el) => {
+    ui.person = el.dataset.person;
+    resetFilters();
+    render();
+  },
+  "open-connect": () => openConnect(),
+  "pick-me": (el) => pickMe(el.dataset.id, !!el.dataset.connecting),
+  "pick-me-again": () => openWhoAmI(false),
+  "open-people": openPeople,
+  "sync-now": async () => {
+    toast("Syncing…");
+    await runSync();
+    toast(sync.status === "ok" ? "Up to date" : syncStatusText());
+    if (ui.view === "more") render();
+  },
+  "sign-out": signOut,
   "open-reminders": openReminders,
   "open-theme": openTheme,
   "set-theme": (el) => {
@@ -1531,6 +2067,14 @@ document.addEventListener("click", (e) => {
 
 const formHandlers = {
   tx: saveTx,
+  connect: submitConnect,
+  people: (form) => {
+    const fd = new FormData(form);
+    db.people = db.people.map((p) => ({ ...p, name: (fd.get(p.id) || p.name).trim() || p.name }));
+    save();
+    closeSheet();
+    render();
+  },
   cat: saveCategory,
   rec: saveRecurring,
   methods: (form) => {
@@ -1669,19 +2213,34 @@ $("#next-month").addEventListener("click", () => {
 $("#fab").addEventListener("click", () => openTxForm(null));
 $("#reminder-add").addEventListener("click", () => openTxForm(null));
 
-// When the app comes back to the front (e.g. next day), add any due repeating entries
+// When the app comes back to the front (e.g. next day), add any due repeating entries and sync
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     if (generateRecurring()) render();
     else checkReminder();
+    runSync();
   }
 });
+window.addEventListener("online", () => runSync());
+$("#sync-signin").addEventListener("click", () => openConnect());
 
 // ---------- Start ----------
 applyTheme();
+if (connected()) takeSnapshot();
 generateRecurring();
 render();
 setInterval(checkReminder, 60 * 1000);
+// Check the family book for the other phone's changes every 15 seconds while the app is open
+setInterval(() => {
+  if (!document.hidden) runSync();
+}, 15 * 1000);
+runSync();
+// First open of this version: offer to connect the family book once
+if (!connected() && !sync.promptSeen) {
+  sync.promptSeen = true;
+  saveSync();
+  openConnect();
+}
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch((err) => console.warn("Offline mode not available:", err));

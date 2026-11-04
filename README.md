@@ -1,7 +1,12 @@
 # Money Book
 
 An income and expense tracker that installs on your phone and works with no internet.
-Your data stays on your phone only. There's no account and no server.
+
+**Family sync:** Yadunath and Radhika each use the app on their own phone and see each other's entries.
+Each phone keeps a full copy (works offline) and swaps changes every ~15 seconds with a private Supabase
+database (project `nlmsnzrzpmfhorgbmhnw`). The tables are created by `supabase-setup.sql`, and only the
+family login can read them. Each person can only edit their own entries (the app enforces this).
+Categories, budgets, repeating entries and goals are shared by the household.
 
 ## What it does
 

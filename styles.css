@@ -475,6 +475,9 @@ main {
   font-size: 13px;
   cursor: pointer;
 }
+.chips.need .chip {
+  border-color: var(--expense);
+}
 .chip.on {
   background: var(--brand-soft);
   border-color: var(--brand);
@@ -553,6 +556,16 @@ main {
 }
 .menu li.clickable {
   cursor: pointer;
+}
+
+.person-bar {
+  max-width: 640px;
+  margin: 10px auto 0;
+  padding: 0 16px;
+}
+.person-bar .chip {
+  flex: 1;
+  text-align: center;
 }
 
 .filters {

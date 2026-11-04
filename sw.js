@@ -1,6 +1,6 @@
 // Service worker: keeps a copy of the app on the phone so it opens with no internet.
 // Bump CACHE when you change any app file, so phones pick up the new version.
-const CACHE = "money-book-v1";
+const CACHE = "money-book-v3";
 const FILES = [
   "./",
   "./index.html",
@@ -29,6 +29,8 @@ self.addEventListener("activate", (event) => {
 // Network first (so updates show up when online), cached copy when offline.
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
+  // Family sync calls go straight to Supabase, never from the cache
+  if (new URL(event.request.url).origin !== self.location.origin) return;
   event.respondWith(
     fetch(event.request)
       .then((res) => {
