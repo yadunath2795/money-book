@@ -1457,14 +1457,26 @@ function restoreFrom(file) {
       if (!Array.isArray(data.transactions) || !Array.isArray(data.categories)) throw new Error("bad file");
       if (connected()) {
         // Shared book: add the backup's missing entries instead of wiping both phones
-        const have = new Set(db.transactions.map((t) => t.id));
-        const missing = data.transactions.filter((t) => !have.has(t.id));
-        if (!missing.length) return toast("Everything in this backup is already in the family book.");
-        if (!confirm(`Add ${missing.length} entries from this backup to the family book?`)) return;
-        for (const t of missing) db.transactions.push({ ...t, person: t.person || me() });
+        // The backup may come from a phone with different category ids: match them by name
+        const known = (id) => db.categories.some((c) => c.id === id);
+        const catFor = (t) => {
+          if (known(t.categoryId)) return t.categoryId;
+          const old = data.categories.find((c) => c.id === t.categoryId);
+          const match = old && db.categories.find((c) => c.type === old.type && c.name.toLowerCase() === old.name.toLowerCase());
+          return match ? match.id : fallbackCategory(t.type)?.id;
+        };
+        const byId = new Map(db.transactions.map((t) => [t.id, t]));
+        const missing = data.transactions.filter((t) => !byId.has(t.id));
+        // Entries already in the book that lost their category (shown as "Unknown")
+        const broken = data.transactions.filter((t) => byId.has(t.id) && !known(byId.get(t.id).categoryId));
+        if (!missing.length && !broken.length) return toast("Everything in this backup is already in the family book.");
+        const parts = [missing.length && `add ${missing.length} entries`, broken.length && `fix the category on ${broken.length} entries`].filter(Boolean);
+        if (!confirm(`From this backup: ${parts.join(" and ")}?`)) return;
+        for (const t of missing) db.transactions.push({ ...t, categoryId: catFor(t), person: t.person || me() });
+        for (const t of broken) byId.get(t.id).categoryId = catFor(t);
         save();
         render();
-        return toast(`Added ${missing.length} entries`);
+        return toast(`Done: ${parts.join(", ")}`);
       }
       if (!confirm(`Replace everything in the app with this backup (${data.transactions.length} entries)?`)) return;
       db = normalize(data);
